@@ -1,69 +1,58 @@
+import time
+
 import jax
 import jax.numpy as jnp
 import mujoco
 from mujoco import mjx
 
-import time
-
-XML="robot.xml"
-
+XML = "robot.xml"
 mjc_model = mujoco.MjModel.from_xml_path(XML)
 mjx_model = mjx.put_model(mjc_model)
+sim_time = 1
 
-
-# Initial condition for robot
-DEFAULT_QPOS_INIT = jax.numpy.zeros(mjx_model.nq)
-sim_time = 5    # seconds
-
-@jax.jit
-def gpu_step(mjx_data):
-    mjx_data = mjx.step(mjx_model, mjx_data)
-    return mjx_data
-
-@jax.jit
-def gpu_step_condition(carry):
-    mjx_data, sim_time = carry
-    return mjx_data.time < sim_time
-
-@jax.jit
-def gpu_step_body(carry):
-    mjx_data, sim_time = carry
-    mjx_data = gpu_step(mjx_data)
-    return mjx_data, sim_time
 
 @jax.jit
 @jax.vmap
-def gpu_batch_sim(vel):
-    mjx_data = mjx.make_data(mjx_model)
-    mjx_data.qvel.at[0].set(vel)
-    carry = (mjx_data, sim_time)
-    mjx_data, _ = jax.lax.while_loop(gpu_step_condition, gpu_step_body, carry)
+def gpu_batch_sim(mjx_data):
+    mjx_data = mjx.step(mjx_model, mjx_data)
     return mjx_data
 
+def benchmark(qpos_init=None, n_sims=1e2, sim_time_arg=sim_time):
+    global sim_time             # gpu_batch_sim needs to access sim_time
+    sim_time = sim_time_arg     # but vmap is cleanest when only qpos_init is passed
 
-def benchmark(qpos_init=DEFAULT_QPOS_INIT, n_sims=1e4, sim_time=1):
     # Test if GPU is enabled
     if jax.local_devices()[0].platform == 'gpu':
         print("GPU is enabled")
     else:
         print("GPU is not enabled")
 
-    vel = jax.numpy.zeros(int(n_sims))
+    if qpos_init is None:
+        # default qpos: all 0s
+        qpos_init = jnp.zeros(mjx_model.nq)
+        qpos_init = qpos_init.at[4].set(1.0) # unit quaternion constraint
 
     # GPU simulation benchmark
     start = time.perf_counter()
-    gpu_batch_sim(vel)
+    mjx_data = mjx.make_data(mjx_model)
+    mjx_data = mjx_data.replace(qpos=qpos_init)
+    mjx_data_batched = jax.tree.map(lambda x: jnp.tile(x, (int(n_sims),) + (1,) * (x.ndim)), mjx_data)
+    while (mjx_data_batched.time.any() < sim_time):
+        mjx_data_batched = gpu_batch_sim(mjx_data_batched)
+    gpu_sim_result = mjx_data_batched.qpos
     print(f"GPU sim: {(time.perf_counter() - start):.3f} seconds")
 
     # CPU simulation benchmark
-    mjc_data = mujoco.MjData(mjc_model)
     start = time.perf_counter()
-    for v in vel:
+    mjc_data = mujoco.MjData(mjc_model)
+    for _ in range(int(n_sims)):
         mjc_data.qpos = qpos_init
-        mjc_data.qvel[0] = v
         while (mjc_data.time < sim_time):
             mujoco.mj_step(mjc_model, mjc_data)
     print(f"CPU sim: {(time.perf_counter() - start):.3f} seconds")
+
+    # Check if the results are the same
+    assert jnp.allclose(gpu_sim_result, mjc_data.qpos, atol=1e-4)
 
 
 if __name__ == '__main__':
